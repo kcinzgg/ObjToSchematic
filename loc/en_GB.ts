@@ -153,6 +153,7 @@ export const en_GB = {
                 structure_blocks: 'Structure blocks (.nbt)',
                 indexed_json: 'Indexed JSON (.json)',
                 uncompressed_json: 'Uncompressed JSON (.json)',
+                magicavoxel: 'MagicaVoxel (.vox)',
             },
         },
         misc: {

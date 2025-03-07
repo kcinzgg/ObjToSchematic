@@ -370,6 +370,10 @@ export class UI {
                             displayLocKey: 'export.components.uncompressed_json',
                             payload: 'uncompressed_json',
                         },
+                        {
+                            displayLocKey: 'export.components.magicavoxel',
+                            payload: 'vox',
+                        },
                     ])
                     .setLabel('export.components.exporter'),
             },

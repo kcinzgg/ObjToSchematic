@@ -152,6 +152,7 @@ export const zh_CN: TLocaleDefinition = {
                 structure_blocks: '结构方块 (.nbt)',
                 indexed_json: '有索引的 JSON (.json)',
                 uncompressed_json: '未压缩的 JSON (.json)',
+                magicavoxel: 'MagicaVoxel体素 (.vox)',
             },
         },
         misc: {

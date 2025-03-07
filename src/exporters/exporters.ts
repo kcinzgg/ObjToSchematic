@@ -5,6 +5,7 @@ import { NBTExporter } from './nbt_exporter';
 import { SchemExporter } from './schem_exporter';
 import { Schematic } from './schematic_exporter';
 import { UncompressedJSONExporter } from './uncompressed_json_exporter';
+import { VoxExporter } from './vox_exporter';
 
 export type TExporters =
     'schematic' |
@@ -12,7 +13,8 @@ export type TExporters =
     'schem' |
     'nbt' |
     'uncompressed_json' |
-    'indexed_json';
+    'indexed_json' |
+    'vox';
 
 export class ExporterFactory {
     public static GetExporter(voxeliser: TExporters): IExporter {
@@ -29,6 +31,8 @@ export class ExporterFactory {
                 return new UncompressedJSONExporter();
             case 'indexed_json':
                 return new IndexedJSONExporter();
+            case 'vox':
+                return new VoxExporter();
         }
     }
 }
