@@ -11,6 +11,9 @@ import { Buffer } from 'buffer';
 // 移除fs和path导入
 // 移除Jimp导入
 
+// 导入颜色量化器
+import { ColorQuantizer } from './color_quantizer';
+
 /**
  * MagicaVoxel (.vox) 格式导出器
  * 简化版本，直接从体素中提取颜色，不处理材质和光照
@@ -305,576 +308,52 @@ export class VoxExporter extends IExporter {
             return { colorMap, palette: [...VoxExporter._presetPalette] };
         }
         
-        // 否则使用现有的动态调色板生成算法
-        // 大幅扩展的预定义基础调色板，特别关注常见建筑材质颜色和MagicaVoxel常用颜色
-        const basePalette: {r: number, g: number, b: number, a: number}[] = [
-            {r: 0, g: 0, b: 0, a: 0},         // 索引0: 透明
-            {r: 255, g: 255, b: 255, a: 255}, // 索引1: 白色
-            {r: 0, g: 0, b: 0, a: 255},       // 索引2: 黑色
+        // 使用MMCQ算法生成优化的调色板
+        console.log(`使用MMCQ算法优化调色板，从${colors.length}种颜色中提取`);
+        
+        // 定义一些关键颜色（透明色、白色、黑色等）
+        const keyColors: {r: number, g: number, b: number, a: number}[] = [
+            {r: 0, g: 0, b: 0, a: 0},         // 透明色
+            {r: 255, g: 255, b: 255, a: 255}, // 白色
+            {r: 0, g: 0, b: 0, a: 255},       // 黑色
+            {r: 128, g: 128, b: 128, a: 255}, // 灰色
             
-            // 灰度系列 - 建筑中常用
-            {r: 32, g: 32, b: 32, a: 255},    // 深黑灰
-            {r: 64, g: 64, b: 64, a: 255},    // 暗灰
-            {r: 96, g: 96, b: 96, a: 255},    // 中深灰
-            {r: 128, g: 128, b: 128, a: 255}, // 中灰
-            {r: 160, g: 160, b: 160, a: 255}, // 中浅灰
-            {r: 192, g: 192, b: 192, a: 255}, // 浅灰
-            {r: 224, g: 224, b: 224, a: 255}, // 近白色
+            // 基本RGB颜色
+            {r: 255, g: 0, b: 0, a: 255},     // 红色
+            {r: 0, g: 255, b: 0, a: 255},     // 绿色
+            {r: 0, g: 0, b: 255, a: 255},     // 蓝色
             
-            // 建筑基础色 - 石材色系
-            {r: 200, g: 200, b: 210, a: 255}, // 石灰色 - 略带蓝
-            {r: 210, g: 206, b: 200, a: 255}, // 浅石色 - 略带黄
-            {r: 180, g: 180, b: 185, a: 255}, // 深石色
-            {r: 170, g: 170, b: 170, a: 255}, // 混凝土色
-            
-            // 木材色系
-            {r: 110, g: 80, b: 50, a: 255},   // 深木色
-            {r: 160, g: 120, b: 90, a: 255},  // 中木色
-            {r: 200, g: 170, b: 120, a: 255}, // 浅木色
-            {r: 180, g: 150, b: 100, a: 255}, // 橡木色
-            
-            // 屋顶蓝色系列 - 特别针对图片中的塔楼屋顶
-            {r: 20, g: 80, b: 170, a: 255},   // 深蓝色屋顶
+            // 塔楼屋顶蓝色系列
             {r: 30, g: 110, b: 190, a: 255},  // 蓝色屋顶
             {r: 40, g: 130, b: 210, a: 255},  // 亮蓝色屋顶
             {r: 70, g: 160, b: 230, a: 255},  // 天蓝色屋顶
-            
-            // 旗帜红色系列
-            {r: 170, g: 30, b: 30, a: 255},   // 深红色
-            {r: 200, g: 50, b: 50, a: 255},   // 红色
-            {r: 230, g: 70, b: 70, a: 255},   // 亮红色
-            
-            // 黄金色系列 - 地基和装饰
-            {r: 200, g: 170, b: 50, a: 255},  // 金色
-            {r: 230, g: 200, b: 80, a: 255},  // 亮金色
-            {r: 170, g: 140, b: 30, a: 255},  // 暗金色
-            
-            // 绿色系列 - 植被
-            {r: 30, g: 120, b: 50, a: 255},   // 深绿色
-            {r: 50, g: 150, b: 70, a: 255},   // 绿色
-            {r: 70, g: 180, b: 90, a: 255},   // 亮绿色
-            
-            // 砖红及棕色系列
-            {r: 140, g: 80, b: 60, a: 255},   // 砖红色
-            {r: 120, g: 60, b: 40, a: 255},   // 深棕色
-            {r: 100, g: 50, b: 30, a: 255},   // 暗棕色
-            
-            // 其他常用基础色
-            {r: 255, g: 0, b: 0, a: 255},     // 纯红
-            {r: 0, g: 255, b: 0, a: 255},     // 纯绿
-            {r: 0, g: 0, b: 255, a: 255},     // 纯蓝
-            {r: 255, g: 255, b: 0, a: 255},   // 纯黄
-            {r: 0, g: 255, b: 255, a: 255},   // 纯青
-            {r: 255, g: 0, b: 255, a: 255},   // 纯紫
+            {r: 20, g: 80, b: 170, a: 255},   // 深蓝色屋顶
         ];
         
-        // 收集所有唯一颜色，忽略完全透明的颜色
-        const uniqueColors = new Set<string>();
-        for (const color of colors) {
-            if (color.a === 0) continue;
-            const key = `${color.r},${color.g},${color.b},${color.a}`;
-            uniqueColors.add(key);
-        }
-        
-        // 如果唯一颜色数量少于限制，直接使用所有颜色
-        if (uniqueColors.size <= VoxExporter.MAX_COLORS - basePalette.length) {
-            const finalPalette = [...basePalette];
-            
-            // 添加所有唯一颜色
-            uniqueColors.forEach(key => {
-                const [r, g, b, a] = key.split(',').map(Number);
-                // 检查颜色是否已在基础调色板中
-                const colorKey = `${r},${g},${b},${a}`;
-                if (!finalPalette.some(c => `${c.r},${c.g},${c.b},${c.a}` === colorKey)) {
-                    finalPalette.push({r, g, b, a});
-                }
-            });
-            
-            // 创建颜色映射
-            const colorMap = new Map<string, number>();
-            finalPalette.forEach((color, index) => {
-                const key = `${color.r},${color.g},${color.b},${color.a}`;
-                colorMap.set(key, index);
-            });
-            
-            return { colorMap, palette: finalPalette };
-        }
-        
-        // 需要进行颜色量化
-        console.log(`需要量化颜色: 发现${uniqueColors.size}种颜色，超过限制`);
-        
-        // 提取所有RGB颜色（不包括透明）
-        const rgbColors: {r: number, g: number, b: number, a: number}[] = [];
-        const alphaColors: {r: number, g: number, b: number, a: number}[] = [];
-        
-        uniqueColors.forEach(key => {
-            const [r, g, b, a] = key.split(',').map(Number);
-            const color = {r, g, b, a};
-            if (a < 255) {
-                alphaColors.push(color);
-            } else {
-                rgbColors.push(color);
-            }
-        });
-        
-        // 统计每种颜色在模型中的出现次数
-        const colorCounts = new Map<string, number>();
-        for (const color of colors) {
-            if (color.a === 0) continue;
-            const key = `${color.r},${color.g},${color.b},${color.a}`;
-            colorCounts.set(key, (colorCounts.get(key) || 0) + 1);
-        }
-        
-        // 转换为HSV并按主色调分类
-        const colorByHueCategory: {[key: string]: {color: {r: number, g: number, b: number, a: number}, hsv: {h: number, s: number, v: number}, count: number}[]} = {};
-        
-        // 定义12个色相类别 (每30度一个类别)
-        const HUE_CATEGORIES = 12;
-        
-        for (const color of rgbColors) {
-            const key = `${color.r},${color.g},${color.b},${color.a}`;
-            const count = colorCounts.get(key) || 0;
-            const hsv = this._rgbToHsv(color.r, color.g, color.b);
-            
-            // 确定色相类别 (0-11)
-            const hueCategory = Math.floor(hsv.h / 360 * HUE_CATEGORIES);
-            
-            if (!colorByHueCategory[hueCategory]) {
-                colorByHueCategory[hueCategory] = [];
-            }
-            
-            colorByHueCategory[hueCategory].push({color, hsv, count});
-        }
-        
-        // 最终调色板
-        const finalPalette = [...basePalette];
-        
-        // 为半透明颜色保留位置
-        const maxAlphaSlots = Math.min(25, alphaColors.length);
-        
-        // 计算每个色相类别可以分配的颜色数
-        const remainingSlots = VoxExporter.MAX_COLORS - basePalette.length - maxAlphaSlots;
-        const categoryCounts = Object.keys(colorByHueCategory).length;
-        
-        // 每个类别至少分配的颜色数
-        let minColorsPerCategory = Math.min(3, Math.floor(remainingSlots / categoryCounts));
-        let extraColorsPool = remainingSlots - (minColorsPerCategory * categoryCounts);
-        
-        // 为每个色相类别分配颜色
-        Object.entries(colorByHueCategory).forEach(([categoryKey, categoryColors]) => {
-            const hueCategory = parseInt(categoryKey);
-            
-            // 如果类别为空，跳过
-            if (categoryColors.length === 0) return;
-            
-            // 按照重要性排序 (饱和度*明度*log(count))
-            categoryColors.sort((a, b) => {
-                const importanceA = (a.hsv.s * 0.7 + 0.3) * (a.hsv.v * 0.7 + 0.3) * Math.log10(1 + a.count);
-                const importanceB = (b.hsv.s * 0.7 + 0.3) * (b.hsv.v * 0.7 + 0.3) * Math.log10(1 + b.count);
-                return importanceB - importanceA;
-            });
-            
-            // 另外排序分级：按饱和度和亮度划分
-            // 分出暗色、中色、亮色各一个代表
-            const darkColors = categoryColors.filter(c => c.hsv.v < 0.4).sort((a, b) => b.count - a.count);
-            const midColors = categoryColors.filter(c => c.hsv.v >= 0.4 && c.hsv.v < 0.7).sort((a, b) => b.count - a.count);
-            const brightColors = categoryColors.filter(c => c.hsv.v >= 0.7).sort((a, b) => b.count - a.count);
-            
-            // 从每个亮度范围选择代表色
-            let selectedCount = 0;
-            const selectedColors: {r: number, g: number, b: number, a: number}[] = [];
-            
-            // 从暗、中、亮各选一个颜色（如果有）
-            if (darkColors.length > 0 && selectedCount < minColorsPerCategory) {
-                selectedColors.push(darkColors[0].color);
-                selectedCount++;
-            }
-            
-            if (midColors.length > 0 && selectedCount < minColorsPerCategory) {
-                selectedColors.push(midColors[0].color);
-                selectedCount++;
-            }
-            
-            if (brightColors.length > 0 && selectedCount < minColorsPerCategory) {
-                selectedColors.push(brightColors[0].color);
-                selectedCount++;
-            }
-            
-            // 如果还有额外配额，使用整体排序
-            if (extraColorsPool > 0) {
-                // 计算这个类别可以额外获得的颜色数量
-                // 基于该类别颜色数量在总颜色中的比例
-                const categoryTotal = categoryColors.length;
-                const totalColors = rgbColors.length;
-                
-                // 至少1个额外颜色，最多不超过剩余的extraColorsPool
-                const extraForThisCategory = Math.min(
-                    Math.max(1, Math.round(extraColorsPool * categoryTotal / totalColors)),
-                    extraColorsPool
-                );
-                
-                // 选择额外的颜色
-                for (let i = 0; i < categoryColors.length && selectedCount < minColorsPerCategory + extraForThisCategory; i++) {
-                    const colorEntry = categoryColors[i];
-                    const key = `${colorEntry.color.r},${colorEntry.color.g},${colorEntry.color.b},${colorEntry.color.a}`;
-                    
-                    // 检查是否已选择
-                    if (!selectedColors.some(c => `${c.r},${c.g},${c.b},${c.a}` === key)) {
-                        selectedColors.push(colorEntry.color);
-                        selectedCount++;
-                    }
-                }
-                
-                extraColorsPool -= (selectedCount - minColorsPerCategory);
-            }
-            
-            // 添加选定的颜色到最终调色板
-            for (const color of selectedColors) {
-                const key = `${color.r},${color.g},${color.b},${color.a}`;
-                
-                // 检查是否已在调色板中
-                if (!finalPalette.some(c => `${c.r},${c.g},${c.b},${c.a}` === key)) {
-                    finalPalette.push(color);
-                }
-            }
-        });
-        
-        // 处理蓝色特殊情况 - 确保有足够的蓝色变体用于塔楼屋顶
-        const specialBlueIndex = Math.floor(240 / 360 * HUE_CATEGORIES); // 蓝色大约在240度
-        if (colorByHueCategory[specialBlueIndex] && colorByHueCategory[specialBlueIndex].length > 0) {
-            const blueVariants = colorByHueCategory[specialBlueIndex]
-                .filter(entry => entry.hsv.s > 0.5 && entry.hsv.v > 0.5) // 筛选鲜艳的蓝色
-                .sort((a, b) => b.count - a.count);
-                
-            // 添加更多蓝色变体
-            for (let i = 0; i < Math.min(5, blueVariants.length); i++) {
-                const blueColor = blueVariants[i].color;
-                const key = `${blueColor.r},${blueColor.g},${blueColor.b},${blueColor.a}`;
-                
-                if (!finalPalette.some(c => `${c.r},${c.g},${c.b},${c.a}` === key)) {
-                    finalPalette.push(blueColor);
-                }
-            }
-        }
-        
-        // 如果还有空位，添加半透明颜色
-        for (let i = 0; i < maxAlphaSlots && i < alphaColors.length && finalPalette.length < VoxExporter.MAX_COLORS; i++) {
-            finalPalette.push(alphaColors[i]);
-        }
-        
-        // 如果仍有空位，填充一些完全生成的渐变色
-        if (finalPalette.length < VoxExporter.MAX_COLORS) {
-            // 生成一些补充色，确保颜色空间覆盖完整
-            // 每60度取一个色相，每个色相取不同饱和度和明度
-            for (let h = 0; h < 360 && finalPalette.length < VoxExporter.MAX_COLORS; h += 60) {
-                for (let s = 0.3; s <= 1 && finalPalette.length < VoxExporter.MAX_COLORS; s += 0.35) {
-                    for (let v = 0.3; v <= 1 && finalPalette.length < VoxExporter.MAX_COLORS; v += 0.35) {
-                        const rgb = this._hsvToRgb(h, s, v);
-                        const genColor = {r: rgb.r, g: rgb.g, b: rgb.b, a: 255};
-                        const key = `${genColor.r},${genColor.g},${genColor.b},${genColor.a}`;
-                        
-                        if (!finalPalette.some(c => `${c.r},${c.g},${c.b},${c.a}` === key)) {
-                            finalPalette.push(genColor);
-                        }
-                    }
-                }
-            }
-        }
+        // 使用MMCQ算法生成调色板，确保包含关键颜色
+        const optimizedPalette = ColorQuantizer.quantizeWithKeyColors(
+            colors,
+            VoxExporter.MAX_COLORS,
+            keyColors
+        );
         
         // 创建颜色映射
         const colorMap = new Map<string, number>();
-        finalPalette.forEach((color, index) => {
+        optimizedPalette.forEach((color, index) => {
             const key = `${color.r},${color.g},${color.b},${color.a}`;
             colorMap.set(key, index);
         });
         
-        console.log(`创建了${finalPalette.length}种颜色的调色板`);
-        
-        if (uniqueColors.size > VoxExporter.MAX_COLORS) {
-            StatusHandler.warning(LOC('something_went_wrong'));
-        }
-        
-        return { colorMap, palette: finalPalette };
-    }
-    
-    /**
-     * RGB转HSV
-     */
-    private _rgbToHsv(r: number, g: number, b: number): {h: number, s: number, v: number} {
-        // 归一化RGB值到0-1
-        const rn = r / 255;
-        const gn = g / 255;
-        const bn = b / 255;
-        
-        const max = Math.max(rn, gn, bn);
-        const min = Math.min(rn, gn, bn);
-        const delta = max - min;
-        
-        // 计算HSV
-        let h = 0;
-        const s = max === 0 ? 0 : delta / max;
-        const v = max;
-        
-        // 计算色相
-        if (delta === 0) {
-            h = 0; // 灰色
-        } else if (max === rn) {
-            h = ((gn - bn) / delta) % 6;
-        } else if (max === gn) {
-            h = (bn - rn) / delta + 2;
-        } else {
-            h = (rn - gn) / delta + 4;
-        }
-        
-        h = Math.round(h * 60);
-        if (h < 0) h += 360;
-        
-        return {h, s, v};
-    }
-    
-    /**
-     * HSV转RGB
-     */
-    private _hsvToRgb(h: number, s: number, v: number): {r: number, g: number, b: number} {
-        const c = v * s;
-        const x = c * (1 - Math.abs((h / 60) % 2 - 1));
-        const m = v - c;
-        
-        let r = 0, g = 0, b = 0;
-        
-        if (h >= 0 && h < 60) {
-            r = c; g = x; b = 0;
-        } else if (h >= 60 && h < 120) {
-            r = x; g = c; b = 0;
-        } else if (h >= 120 && h < 180) {
-            r = 0; g = c; b = x;
-        } else if (h >= 180 && h < 240) {
-            r = 0; g = x; b = c;
-        } else if (h >= 240 && h < 300) {
-            r = x; g = 0; b = c;
-        } else {
-            r = c; g = 0; b = x;
-        }
-        
-        return {
-            r: Math.round((r + m) * 255),
-            g: Math.round((g + m) * 255),
-            b: Math.round((b + m) * 255)
-        };
+        console.log(`创建了${optimizedPalette.length}种颜色的优化调色板`);
+        return { colorMap, palette: optimizedPalette };
     }
     
     /**
      * 查找最接近的颜色索引
      */
     private _findClosestColorIndex(targetColor: {r: number, g: number, b: number, a: number}, palette: {r: number, g: number, b: number, a: number}[]): number {
-        // 处理透明度特例
-        if (targetColor.a < 128) {
-            return 0; // 透明色
-        }
-        
-        // 如果使用预设调色板，使用更简单的欧氏距离计算
-        if (VoxExporter._usePresetPalette && VoxExporter._presetPalette !== null) {
-            let closestIndex = 1; // 默认是白色(索引1)
-            let minDistance = Number.MAX_VALUE;
-            
-            for (let i = 1; i < palette.length; i++) {
-                const color = palette[i];
-                
-                // 计算RGB空间中的欧氏距离
-                const distance = Math.sqrt(
-                    Math.pow(targetColor.r - color.r, 2) +
-                    Math.pow(targetColor.g - color.g, 2) +
-                    Math.pow(targetColor.b - color.b, 2)
-                );
-                
-                if (distance < minDistance) {
-                    minDistance = distance;
-                    closestIndex = i;
-                }
-            }
-            
-            return closestIndex;
-        }
-        
-        // 否则使用现有的复杂颜色匹配算法
-        // 转换为HSV颜色空间
-        const targetHSV = this._rgbToHsv(targetColor.r, targetColor.g, targetColor.b);
-        
-        // 处理特殊颜色情况
-        
-        // 1. 蓝色屋顶情况 - 特别处理蓝色，确保蓝色屋顶被正确识别
-        const isBlueRoof = targetHSV.h >= 200 && targetHSV.h <= 250 && 
-                          targetHSV.s > 0.5 && targetHSV.v > 0.5;
-        
-        if (isBlueRoof) {
-            // 寻找最匹配的蓝色
-            let bestBlueIndex = 1; // 默认白色
-            let minBlueDiff = Number.MAX_VALUE;
-            
-            for (let i = 0; i < palette.length; i++) {
-                const color = palette[i];
-                if (color.a === 0) continue; // 跳过透明色
-                
-                const hsv = this._rgbToHsv(color.r, color.g, color.b);
-                
-                // 检查是否为蓝色范围
-                if (hsv.h >= 200 && hsv.h <= 250 && hsv.s > 0.4) {
-                    // 计算色相、饱和度和明度的加权差值
-                    const hueDiff = Math.abs(targetHSV.h - hsv.h) / 50; // 归一化到0-1
-                    const satDiff = Math.abs(targetHSV.s - hsv.s);
-                    const valDiff = Math.abs(targetHSV.v - hsv.v);
-                    
-                    // 总差异，明度权重更高
-                    const totalDiff = hueDiff * 0.3 + satDiff * 0.3 + valDiff * 0.4;
-                    
-                    if (totalDiff < minBlueDiff) {
-                        minBlueDiff = totalDiff;
-                        bestBlueIndex = i;
-                    }
-                }
-            }
-            
-            // 如果找到了合适的蓝色
-            if (minBlueDiff < 0.4) {
-                return bestBlueIndex;
-            }
-        }
-        
-        // 2. 处理灰度颜色
-        const isGrey = targetHSV.s < 0.15;
-        
-        if (isGrey) {
-            // 寻找最接近的灰度
-            let bestGreyIndex = 1; // 默认白色
-            let minValueDiff = Number.MAX_VALUE;
-            
-            for (let i = 0; i < palette.length; i++) {
-                const color = palette[i];
-                // 跳过透明色
-                if (color.a === 0) continue;
-                
-                const hsv = this._rgbToHsv(color.r, color.g, color.b);
-                
-                // 检查是否为灰色(低饱和度)
-                if (hsv.s < 0.15) {
-                    const valueDiff = Math.abs(hsv.v - targetHSV.v);
-                    if (valueDiff < minValueDiff) {
-                        minValueDiff = valueDiff;
-                        bestGreyIndex = i;
-                    }
-                }
-            }
-            
-            if (minValueDiff < 0.15) {
-                return bestGreyIndex;
-            }
-        }
-        
-        // 3. 处理木材和砖红色系
-        const isWoodOrBrick = (targetHSV.h >= 10 && targetHSV.h <= 50) && 
-                              targetHSV.s > 0.2 && targetHSV.s < 0.8 &&
-                              targetHSV.v > 0.2 && targetHSV.v < 0.8;
-                              
-        if (isWoodOrBrick) {
-            let bestIndex = 1;
-            let minDiff = Number.MAX_VALUE;
-            
-            for (let i = 0; i < palette.length; i++) {
-                const color = palette[i];
-                if (color.a === 0) continue;
-                
-                const hsv = this._rgbToHsv(color.r, color.g, color.b);
-                
-                // 检查是否为木材或砖红色范围
-                if (hsv.h >= 10 && hsv.h <= 50 && 
-                    hsv.s > 0.2 && hsv.s < 0.8 &&
-                    hsv.v > 0.2 && hsv.v < 0.8) {
-                    
-                    const hueDiff = Math.abs(targetHSV.h - hsv.h) / 40;
-                    const satDiff = Math.abs(targetHSV.s - hsv.s);
-                    const valDiff = Math.abs(targetHSV.v - hsv.v);
-                    
-                    const totalDiff = hueDiff * 0.4 + satDiff * 0.3 + valDiff * 0.3;
-                    
-                    if (totalDiff < minDiff) {
-                        minDiff = totalDiff;
-                        bestIndex = i;
-                    }
-                }
-            }
-            
-            if (minDiff < 0.3) {
-                return bestIndex;
-            }
-        }
-        
-        // 普通颜色匹配逻辑
-        let closestIndex = 1; // 默认是白色(索引1)
-        let minDistance = Number.MAX_VALUE;
-        
-        // 透明度敏感匹配
-        const isTargetSemiTransparent = targetColor.a >= 128 && targetColor.a < 250;
-        
-        for (let i = 1; i < palette.length; i++) {
-            const color = palette[i];
-            
-            // 处理透明度匹配
-            const isPaletteSemiTransparent = color.a >= 128 && color.a < 250;
-            
-            // 如果是半透明色，则优先匹配半透明与否相同的颜色
-            if (isTargetSemiTransparent !== isPaletteSemiTransparent) {
-                continue; // 跳过透明度不匹配的颜色
-            }
-            
-            // HSV颜色空间中的距离计算
-            const hsv = this._rgbToHsv(color.r, color.g, color.b);
-            
-            // 色相距离 (考虑色环特性)
-            let hueDiff = Math.abs(targetHSV.h - hsv.h);
-            if (hueDiff > 180) hueDiff = 360 - hueDiff;
-            
-            // 归一化距离分量
-            const normHueDiff = hueDiff / 180.0;
-            const satDiff = Math.abs(targetHSV.s - hsv.s);
-            const valDiff = Math.abs(targetHSV.v - hsv.v);
-            
-            // 饱和度与明度的权重应根据颜色特性动态调整
-            let hueWeight = 1.0;
-            let satWeight = 1.0;
-            let valWeight = 1.2;
-            
-            // 对于低饱和度颜色，降低色相重要性，提高明度重要性
-            if (targetHSV.s < 0.2 || hsv.s < 0.2) {
-                hueWeight = 0.3;
-                valWeight = 1.8;
-            }
-            
-            // 对于高饱和度颜色，提高色相重要性
-            if (targetHSV.s > 0.7 && hsv.s > 0.7) {
-                hueWeight = 1.5;
-                satWeight = 0.8;
-            }
-            
-            // 对于暗色，提高饱和度重要性
-            if (targetHSV.v < 0.2 || hsv.v < 0.2) {
-                satWeight = 0.5;
-                valWeight = 1.8;
-            }
-            
-            // 计算加权欧氏距离
-            const distance = Math.sqrt(
-                hueWeight * normHueDiff * normHueDiff +
-                satWeight * satDiff * satDiff +
-                valWeight * valDiff * valDiff
-            );
-            
-            if (distance < minDistance) {
-                minDistance = distance;
-                closestIndex = i;
-            }
-        }
-        
-        return closestIndex;
+        // 使用ColorQuantizer的颜色匹配算法
+        return ColorQuantizer.findClosestColorIndex(targetColor, palette);
     }
     
     /**
