@@ -1,53 +1,45 @@
 import { BlockMesh } from '../block_mesh';
-import { RGBA, RGBAColours, RGBAUtil } from '../colour';
-import { ASSERT } from '../util/error_util';
-import { LOG } from '../util/log_util';
 import { Vector3 } from '../vector';
 import { Voxel } from '../voxel_mesh';
+import { RGBA } from '../colour';
 import { IExporter, TStructureExport } from './base_exporter';
+import { ASSERT, AppError } from '../util/error_util';
+import { LOC } from '../localiser';
+import { StatusHandler } from '../status';
+import { ProgressManager } from '../progress';
+import { Buffer } from 'buffer';
 
 /**
- * 实现MagicaVoxel的.vox格式导出
- * 格式规范参考: https://github.com/ephtracy/voxel-model/blob/master/MagicaVoxel-file-format-vox.txt
+ * MagicaVoxel (.vox) 格式导出器
+ * 简化版本，直接从体素中提取颜色，不处理材质和光照
  */
 export class VoxExporter extends IExporter {
-    // 定义光照方向，与着色器中相同
-    private readonly _lightDirection = new Vector3(0.78, 0.98, 0.59).normalise();
+    /** 最大安全体素数量 */
+    public static readonly MAX_SAFE_VOXELS = 400000;
     
-    // 最小和最大光照值 - 进一步提高
-    private readonly _minLightLevel = 0.9;   // 进一步提高基础亮度
-    private readonly _maxLightLevel = 1.8;   // 增强最大亮度
+    /** VOX格式支持的最大尺寸 */
+    public static readonly MAX_SIZE = 256;
     
-    // 环境光水平 - 添加更强的环境光
-    private readonly _ambientLight = 0.7;    // 70%的环境光
+    /** VOX格式支持的最大颜色数量 */
+    public static readonly MAX_COLORS = 255; // 256-1，因为0是透明色
     
-    // 颜色增强因子 - 更激进
-    private readonly _colorBoost = 1.5;      // 更强的颜色提升
+    /** 单批处理的体素数量 */
+    private static readonly BATCH_SIZE = 200;
     
-    // 模型尺寸和特征
-    private _modelBounds: { min: Vector3, max: Vector3, center: Vector3, height: number } | null = null;
+    /** 导出是否正在进行中 */
+    private _isExporting: boolean = false;
     
-    // 材质定义
-    private readonly _materialTypes = {
-        STONE: 'stone',
-        WOOD: 'wood',
-        METAL: 'metal',
-        WINDOW: 'window',
-        ROOF: 'roof',
-        GROUND: 'ground',
-        UNKNOWN: 'unknown'
-    };
+    /** 导出结果 */
+    private _exportResult: TStructureExport | null = null;
     
-    // 材质增强参数
-    private readonly _materialEnhancement = {
-        stone: { lightBoost: 1.5, saturation: 1.1, brightnessShift: 0.2 },
-        wood: { lightBoost: 1.7, saturation: 1.5, brightnessShift: 0.25 },
-        metal: { lightBoost: 2.0, saturation: 0.9, brightnessShift: 0.3 },
-        window: { lightBoost: 2.5, saturation: 1.2, brightnessShift: 0.4 },
-        roof: { lightBoost: 1.6, saturation: 1.4, brightnessShift: 0.15 },
-        ground: { lightBoost: 1.4, saturation: 1.3, brightnessShift: 0.1 },
-        unknown: { lightBoost: 1.5, saturation: 1.2, brightnessShift: 0.2 }
-    };
+    /** 导出错误 */
+    private _exportError: Error | null = null;
+    
+    /** 导出完成的回调函数 */
+    private _exportCallback: ((result: TStructureExport) => void) | null = null;
+    
+    /** 进度管理任务ID */
+    private _taskId: any = null;
     
     public override getFormatFilter() {
         return {
@@ -55,587 +47,838 @@ export class VoxExporter extends IExporter {
             extension: 'vox',
         };
     }
-
+    
     public override export(blockMesh: BlockMesh): TStructureExport {
-        const voxData = this._createVoxData(blockMesh);
-        // 将Uint8Array转换为Buffer
-        return { type: 'single', extension: '.vox', content: Buffer.from(voxData) };
+        // 如果已经在导出中，抛出错误
+        if (this._isExporting) {
+            throw new Error('An export is already in progress. Please wait for it to complete.');
+        }
+        
+        // 标记导出开始
+        this._isExporting = true;
+        this._exportResult = null;
+        this._exportError = null;
+        
+        // 创建一个进度任务
+        this._taskId = ProgressManager.Get.start('Exporting');
+        if (this._taskId) {
+            ProgressManager.Get.progress(this._taskId, 0.01);
+        }
+        
+        // 显示状态消息
+        StatusHandler.info(LOC('export.exporting_structure'));
+        
+        try {
+            // 获取所有方块
+            const blocks = blockMesh.getBlocks();
+            console.log('Blocks:', blocks.length);
+            
+            // 安全检查 - 如果方块数量太多，可能会导致浏览器卡死
+            if (blocks.length > VoxExporter.MAX_SAFE_VOXELS) {
+                if (this._taskId) {
+                    ProgressManager.Get.end(this._taskId);
+                }
+                this._isExporting = false;
+                throw new AppError(LOC('something_went_wrong'));
+            }
+            
+            // 同步处理体素数据
+            const { buffer, extension } = this._processVoxDataSync(blockMesh);
+            
+            // 更新进度
+            if (this._taskId) {
+                ProgressManager.Get.progress(this._taskId, 1.0);
+                ProgressManager.Get.end(this._taskId);
+                this._taskId = null;
+            }
+            
+            // 标记导出完成
+            this._isExporting = false;
+            
+            // 返回结果
+            return {
+                type: 'single',
+                extension: extension,
+                content: buffer
+            };
+        } catch (error) {
+            // 出现错误，结束导出状态
+            if (this._taskId) {
+                ProgressManager.Get.end(this._taskId);
+                this._taskId = null;
+            }
+            this._isExporting = false;
+            console.error('VOX导出错误:', error);
+            if (error instanceof AppError) {
+                throw error;
+            } else {
+                throw new AppError(LOC('something_went_wrong'));
+            }
+        }
     }
-
-    private _createVoxData(blockMesh: BlockMesh): Uint8Array {
+    
+    /**
+     * 同步处理体素数据并创建VOX文件
+     */
+    private _processVoxDataSync(blockMesh: BlockMesh): { buffer: Buffer, extension: string } {
         // 获取体素网格
         const voxelMesh = blockMesh.getVoxelMesh();
         ASSERT(voxelMesh !== undefined, "Voxel mesh is undefined");
-
+        
         // 从体素网格中获取所有体素
         const voxels = voxelMesh.getVoxels();
-        LOG(`处理${voxels.length}个体素用于VOX导出`);
+        console.log(`处理${voxels.length}个体素用于VOX导出`);
         
         // 获取模型的边界
         const bounds = voxelMesh.getBounds();
         const minPos = bounds.min;
-        const size = Vector3.sub(bounds.max, bounds.min).add(1);
-        
-        // 计算并存储模型的一些关键特征，用于后续材质判定
-        this._analyzeModelFeatures(bounds, voxels);
+        const size = Vector3.sub(bounds.max, bounds.min).add(new Vector3(1, 1, 1));
         
         // 确保模型尺寸不超过VOX格式的最大限制(256x256x256)
-        ASSERT(size.x <= 256 && size.y <= 256 && size.z <= 256, 
-            `Model size exceeds VOX format limits: ${size.x}x${size.y}x${size.z}`);
-        
-        // 预处理：计算每个体素的估计法线和应用光照
-        const voxelsWithLighting = this._applyLighting(voxels, voxelMesh);
-        
-        // 提取并处理颜色
-        const { colorMap, palette } = this._processColors(voxelsWithLighting);
-        
-        // 创建文件内容
-        // 1. 文件头
-        const header = new Uint8Array([
-            // "VOX " 魔数
-            0x56, 0x4F, 0x58, 0x20,
-            // 版本号 (150)
-            150, 0, 0, 0
-        ]);
-        
-        // 2. MAIN块
-        const mainChunk = this._createMainChunk(voxelsWithLighting, minPos, size, colorMap, palette);
-        
-        // 合并所有数据
-        const result = new Uint8Array(header.length + mainChunk.length);
-        result.set(header, 0);
-        result.set(mainChunk, header.length);
-        
-        return result;
-    }
-    
-    /**
-     * 分析模型特征用于材质识别
-     */
-    private _analyzeModelFeatures(bounds: { min: Vector3, max: Vector3 }, voxels: Voxel[]) {
-        const center = new Vector3(
-            (bounds.min.x + bounds.max.x) / 2,
-            (bounds.min.y + bounds.max.y) / 2,
-            (bounds.min.z + bounds.max.z) / 2
-        );
-        
-        const height = bounds.max.y - bounds.min.y;
-        
-        this._modelBounds = {
-            min: bounds.min,
-            max: bounds.max,
-            center: center,
-            height: height
-        };
-        
-        LOG(`模型分析: 中心点(${center.x.toFixed(1)}, ${center.y.toFixed(1)}, ${center.z.toFixed(1)}), 高度: ${height.toFixed(1)}`);
-    }
-    
-    /**
-     * 应用光照效果到体素颜色上，并识别材质
-     */
-    private _applyLighting(voxels: Voxel[], voxelMesh: any): Array<Voxel & { litColor: RGBA, material: string }> {
-        // 创建位置到索引的映射以便快速查找邻居
-        const positionMap = new Map<number, number>();
-        voxels.forEach((voxel, index) => {
-            positionMap.set(voxel.position.hash(), index);
-        });
-        
-        // 应用光照处理
-        return voxels.map(voxel => {
-            // 识别体素材质
-            const material = this._identifyMaterial(voxel);
-            
-            // 计算估计法线
-            const normal = this._estimateNormal(voxel, positionMap, voxels);
-            
-            // 计算光照系数
-            const lightLevel = this._calculateLighting(normal);
-            
-            // 根据材质应用特定的光照和颜色增强
-            const litColor = this._enhanceColorByMaterial(voxel.colour, lightLevel, material);
-            
-            // 返回带有烘焙光照和材质的体素
-            return {
-                ...voxel,
-                litColor,
-                material
-            };
-        });
-    }
-    
-    /**
-     * 识别体素的材质类型
-     */
-    private _identifyMaterial(voxel: Voxel): string {
-        if (!this._modelBounds) return this._materialTypes.UNKNOWN;
-        
-        const color = voxel.colour;
-        const pos = voxel.position;
-        
-        // 计算位置相关特征
-        const heightPercent = (pos.y - this._modelBounds.min.y) / this._modelBounds.height;
-        const distFromCenter = Math.sqrt(
-            Math.pow(pos.x - this._modelBounds.center.x, 2) +
-            Math.pow(pos.z - this._modelBounds.center.z, 2)
-        );
-        
-        // 计算颜色特征
-        const brightness = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b;
-        const isGrayscale = Math.abs(color.r - color.g) < 0.1 && Math.abs(color.r - color.b) < 0.1;
-        const redDominance = color.r > color.g * 1.2 && color.r > color.b * 1.2;
-        const blueDominance = color.b > color.r * 1.2 && color.b > color.g * 1.2;
-        
-        // 基于位置和颜色特征识别材质
-        
-        // 检测地面/底座 (底部20%的蓝色系区域)
-        if (heightPercent < 0.2 && (blueDominance || brightness > 0.7)) {
-            return this._materialTypes.GROUND;
+        if (size.x > VoxExporter.MAX_SIZE || size.y > VoxExporter.MAX_SIZE || size.z > VoxExporter.MAX_SIZE) {
+            throw new AppError(LOC('something_went_wrong'));
         }
         
-        // 检测窗户 (中部区域的高亮度或高对比度部分)
-        if (heightPercent > 0.3 && heightPercent < 0.8 && brightness > 0.6) {
-            return this._materialTypes.WINDOW;
-        }
-        
-        // 检测屋顶 (顶部的褐色系区域)
-        if (heightPercent > 0.75 && redDominance) {
-            return this._materialTypes.ROOF;
-        }
-        
-        // 检测金属部分 (高亮度，灰色调)
-        if (brightness > 0.7 && isGrayscale) {
-            return this._materialTypes.METAL;
-        }
-        
-        // 检测木质部分 (中亮度，偏褐色)
-        if (brightness > 0.3 && brightness < 0.7 && redDominance) {
-            return this._materialTypes.WOOD;
-        }
-        
-        // 默认为石头 (灰色系，大部分建筑结构)
-        if (isGrayscale || (brightness < 0.5 && !redDominance && !blueDominance)) {
-            return this._materialTypes.STONE;
-        }
-        
-        return this._materialTypes.UNKNOWN;
-    }
-    
-    /**
-     * 根据材质类型增强颜色
-     */
-    private _enhanceColorByMaterial(color: RGBA, lightLevel: number, material: string): RGBA {
-        // 安全地访问材质参数
-        const params = this._materialEnhancement[material as keyof typeof this._materialEnhancement] 
-            || this._materialEnhancement.unknown;
-        const litColor = RGBAUtil.copy(color);
-        
-        // 结合环境光和方向光
-        const finalLightLevel = this._ambientLight + 
-            (lightLevel * (1.0 - this._ambientLight) * params.lightBoost);
-        
-        // 转换为HSL以便调整饱和度和亮度
-        const hsl = this._rgbToHsl(litColor.r, litColor.g, litColor.b);
-        
-        // 增强饱和度
-        hsl.s = Math.min(1.0, hsl.s * params.saturation);
-        
-        // 增强亮度
-        hsl.l = Math.min(1.0, hsl.l * finalLightLevel + params.brightnessShift);
-        
-        // 转回RGB
-        const rgb = this._hslToRgb(hsl.h, hsl.s, hsl.l);
-        
-        litColor.r = rgb.r;
-        litColor.g = rgb.g;
-        litColor.b = rgb.b;
-        
-        return litColor;
-    }
-    
-    /**
-     * RGB转HSL
-     */
-    private _rgbToHsl(r: number, g: number, b: number): { h: number, s: number, l: number } {
-        const max = Math.max(r, g, b);
-        const min = Math.min(r, g, b);
-        let h = 0, s = 0;
-        const l = (max + min) / 2;
-        
-        if (max !== min) {
-            const d = max - min;
-            s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-            
-            switch (max) {
-                case r: h = (g - b) / d + (g < b ? 6 : 0); break;
-                case g: h = (b - r) / d + 2; break;
-                case b: h = (r - g) / d + 4; break;
-            }
-            
-            h /= 6;
-        }
-        
-        return { h, s, l };
-    }
-    
-    /**
-     * HSL转RGB
-     */
-    private _hslToRgb(h: number, s: number, l: number): { r: number, g: number, b: number } {
-        let r, g, b;
-        
-        if (s === 0) {
-            r = g = b = l; // 灰色
-        } else {
-            const hue2rgb = (p: number, q: number, t: number) => {
-                if (t < 0) t += 1;
-                if (t > 1) t -= 1;
-                if (t < 1/6) return p + (q - p) * 6 * t;
-                if (t < 1/2) return q;
-                if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
-                return p;
-            };
-            
-            const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-            const p = 2 * l - q;
-            
-            r = hue2rgb(p, q, h + 1/3);
-            g = hue2rgb(p, q, h);
-            b = hue2rgb(p, q, h - 1/3);
-        }
-        
-        return { r, g, b };
-    }
-    
-    /**
-     * 估计体素的法线方向
-     * 通过检查周围6个方向是否有体素来确定
-     */
-    private _estimateNormal(voxel: Voxel, positionMap: Map<number, number>, allVoxels: Voxel[]): Vector3 {
-        // 检查6个主要方向
-        const directions = [
-            new Vector3(1, 0, 0),   // +X
-            new Vector3(-1, 0, 0),  // -X
-            new Vector3(0, 1, 0),   // +Y
-            new Vector3(0, -1, 0),  // -Y
-            new Vector3(0, 0, 1),   // +Z
-            new Vector3(0, 0, -1),  // -Z
-        ];
-        
-        // 累计法线贡献
-        const normal = new Vector3(0, 0, 0);
-        
-        // 检查每个方向
-        directions.forEach(dir => {
-            const neighborPos = Vector3.add(voxel.position, dir);
-            const neighborHash = neighborPos.hash();
-            
-            // 如果该方向没有体素，则认为法线朝向该方向
-            if (!positionMap.has(neighborHash)) {
-                normal.add(dir);
-            }
-        });
-        
-        // 如果所有方向都有体素或都没有，使用默认向上的法线
-        if (normal.magnitude() < 0.001) {
-            normal.y = 1;  // 默认向上
-        } else {
-            normal.normalise();
-        }
-        
-        // 倾向于向光源方向偏移法线，提高整体亮度
-        const lightBias = 0.4; // 40%的光源偏移
-        normal.x = normal.x * (1 - lightBias) + this._lightDirection.x * lightBias;
-        normal.y = normal.y * (1 - lightBias) + this._lightDirection.y * lightBias;
-        normal.z = normal.z * (1 - lightBias) + this._lightDirection.z * lightBias;
-        normal.normalise();
-        
-        return normal;
-    }
-    
-    /**
-     * 计算光照系数
-     */
-    private _calculateLighting(normal: Vector3): number {
-        // 基于法线和光照方向计算光照系数（与着色器逻辑类似）
-        const dotProduct = Math.abs(Vector3.dot(normal, this._lightDirection));
-        
-        // 确保基础光照水平，避免完全黑暗
-        const lightLevel = this._minLightLevel + 
-            (this._maxLightLevel - this._minLightLevel) * dotProduct;
-            
-        return lightLevel;
-    }
-    
-    /**
-     * 处理颜色数据，使用带有光照效果的颜色
-     */
-    private _processColors(voxels: Array<Voxel & { litColor: RGBA, material: string }>): { colorMap: Map<string, number>, palette: Uint8Array } {
-        // 直接使用应用了光照的体素颜色
-        const uniqueColors = new Map<string, { color: RGBA, count: number }>();
-        
-        // 统计各种材质数量
-        const materialCount: Record<string, number> = {};
-        
-        // 收集所有唯一颜色及其使用次数
+        // 收集所有颜色并转换为RGBA整数值
+        const allColors: {r: number, g: number, b: number, a: number}[] = [];
         voxels.forEach(voxel => {
-            // 统计材质
-            materialCount[voxel.material] = (materialCount[voxel.material] || 0) + 1;
+            allColors.push({
+                r: Math.round(voxel.colour.r * 255),
+                g: Math.round(voxel.colour.g * 255),
+                b: Math.round(voxel.colour.b * 255),
+                a: Math.round(voxel.colour.a * 255)
+            });
+        });
+        
+        // 智能处理调色板 - 优先确保重要/常见颜色
+        const { colorMap, palette } = this._createOptimizedPalette(allColors);
+        
+        // 处理体素，分配颜色索引
+        const processedVoxels: Array<{x: number, y: number, z: number, colorIndex: number}> = [];
+        
+        for (const voxel of voxels) {
+            // 计算相对位置
+            const x = Math.floor(voxel.position.x - minPos.x);
+            const y = Math.floor(voxel.position.y - minPos.y);
+            const z = Math.floor(voxel.position.z - minPos.z);
             
-            // 使用带光照的颜色
-            const key = this._colorToKey(voxel.litColor);
-            
-            if (uniqueColors.has(key)) {
-                uniqueColors.get(key)!.count++;
-            } else {
-                uniqueColors.set(key, { 
-                    color: RGBAUtil.copy(voxel.litColor), 
-                    count: 1 
-                });
+            // 安全检查
+            if (x < 0 || y < 0 || z < 0 || x >= VoxExporter.MAX_SIZE || y >= VoxExporter.MAX_SIZE || z >= VoxExporter.MAX_SIZE) {
+                continue; // 跳过超出范围的体素
             }
-        });
-        
-        // 打印材质统计
-        LOG('材质统计:');
-        Object.keys(materialCount).forEach(mat => {
-            LOG(`  ${mat}: ${materialCount[mat]}体素`);
-        });
-        
-        // 添加一些基础颜色，确保调色板不为空
-        this._addBasicColors(uniqueColors);
-        
-        // 转换为数组并按使用频率排序
-        const colorEntries = Array.from(uniqueColors.entries())
-            .map(([key, entry]) => ({ key, color: entry.color, count: entry.count }))
-            .sort((a, b) => b.count - a.count); // 使用频率高的颜色优先
-        
-        // 限制颜色数量为255（VOX格式限制）
-        const limitedColors = colorEntries.slice(0, 255);
-        
-        // 创建最终的颜色映射和调色板
-        const colorMap = new Map<string, number>();
-        const palette = new Uint8Array(256 * 4);
-        
-        // 设置默认色(索引0为默认透明色)
-        palette[0] = 0; palette[1] = 0; palette[2] = 0; palette[3] = 0;
-        
-        // 填充调色板
-        limitedColors.forEach((entry, index) => {
-            const i = index + 1; // 从1开始，0是透明色
-            colorMap.set(entry.key, i);
             
-            // MagicaVoxel使用BGRA格式存储颜色
-            palette[i * 4] = Math.round(entry.color.b * 255);     // B
-            palette[i * 4 + 1] = Math.round(entry.color.g * 255); // G
-            palette[i * 4 + 2] = Math.round(entry.color.r * 255); // R
-            palette[i * 4 + 3] = Math.round(entry.color.a * 255); // A
-        });
+            // 转换颜色
+            const color = {
+                r: Math.round(voxel.colour.r * 255),
+                g: Math.round(voxel.colour.g * 255),
+                b: Math.round(voxel.colour.b * 255),
+                a: Math.round(voxel.colour.a * 255)
+            };
+            
+            // 使用调色板映射获取颜色索引
+            const colorKey = `${color.r},${color.g},${color.b},${color.a}`;
+            let colorIndex: number;
+            
+            if (colorMap.has(colorKey)) {
+                colorIndex = colorMap.get(colorKey)!;
+            } else {
+                // 查找最接近的颜色
+                colorIndex = this._findClosestColorIndex(color, palette);
+            }
+            
+            // 添加到处理后的体素列表
+            processedVoxels.push({ x, y, z, colorIndex });
+        }
         
-        LOG(`为VOX格式处理了${limitedColors.length}种颜色`);
-        return { colorMap, palette };
+        // 创建VOX文件头
+        const headerBuffer = this._createVoxHeader();
+        
+        // 创建主块
+        const mainBuffer = this._createMainChunk(size.x, size.y, size.z, processedVoxels, palette);
+        
+        // 合并所有部分
+        const fileBuffer = Buffer.concat([headerBuffer, mainBuffer]);
+        
+        return {
+            buffer: fileBuffer,
+            extension: '.vox'
+        };
     }
     
     /**
-     * 添加基础颜色到颜色集合
+     * 创建优化的调色板
      */
-    private _addBasicColors(colorMap: Map<string, { color: RGBA, count: number }>) {
-        // 基础颜色集合
-        const basicColors = [
-            RGBAColours.RED,
-            RGBAColours.GREEN, 
-            RGBAColours.BLUE,
-            RGBAColours.YELLOW,
-            RGBAColours.CYAN,
-            RGBAColours.MAGENTA,
-            RGBAColours.WHITE,
-            RGBAColours.BLACK,
-            { r: 0.5, g: 0.5, b: 0.5, a: 1.0 } // 灰色
+    private _createOptimizedPalette(colors: {r: number, g: number, b: number, a: number}[]): { 
+        colorMap: Map<string, number>, 
+        palette: {r: number, g: number, b: number, a: number}[] 
+    } {
+        // 大幅扩展的预定义基础调色板，特别关注常见建筑材质颜色和MagicaVoxel常用颜色
+        const basePalette: {r: number, g: number, b: number, a: number}[] = [
+            {r: 0, g: 0, b: 0, a: 0},         // 索引0: 透明
+            {r: 255, g: 255, b: 255, a: 255}, // 索引1: 白色
+            {r: 0, g: 0, b: 0, a: 255},       // 索引2: 黑色
+            
+            // 灰度系列 - 建筑中常用
+            {r: 32, g: 32, b: 32, a: 255},    // 深黑灰
+            {r: 64, g: 64, b: 64, a: 255},    // 暗灰
+            {r: 96, g: 96, b: 96, a: 255},    // 中深灰
+            {r: 128, g: 128, b: 128, a: 255}, // 中灰
+            {r: 160, g: 160, b: 160, a: 255}, // 中浅灰
+            {r: 192, g: 192, b: 192, a: 255}, // 浅灰
+            {r: 224, g: 224, b: 224, a: 255}, // 近白色
+            
+            // 建筑基础色 - 石材色系
+            {r: 200, g: 200, b: 210, a: 255}, // 石灰色 - 略带蓝
+            {r: 210, g: 206, b: 200, a: 255}, // 浅石色 - 略带黄
+            {r: 180, g: 180, b: 185, a: 255}, // 深石色
+            {r: 170, g: 170, b: 170, a: 255}, // 混凝土色
+            
+            // 木材色系
+            {r: 110, g: 80, b: 50, a: 255},   // 深木色
+            {r: 160, g: 120, b: 90, a: 255},  // 中木色
+            {r: 200, g: 170, b: 120, a: 255}, // 浅木色
+            {r: 180, g: 150, b: 100, a: 255}, // 橡木色
+            
+            // 屋顶蓝色系列 - 特别针对图片中的塔楼屋顶
+            {r: 20, g: 80, b: 170, a: 255},   // 深蓝色屋顶
+            {r: 30, g: 110, b: 190, a: 255},  // 蓝色屋顶
+            {r: 40, g: 130, b: 210, a: 255},  // 亮蓝色屋顶
+            {r: 70, g: 160, b: 230, a: 255},  // 天蓝色屋顶
+            
+            // 旗帜红色系列
+            {r: 170, g: 30, b: 30, a: 255},   // 深红色
+            {r: 200, g: 50, b: 50, a: 255},   // 红色
+            {r: 230, g: 70, b: 70, a: 255},   // 亮红色
+            
+            // 黄金色系列 - 地基和装饰
+            {r: 200, g: 170, b: 50, a: 255},  // 金色
+            {r: 230, g: 200, b: 80, a: 255},  // 亮金色
+            {r: 170, g: 140, b: 30, a: 255},  // 暗金色
+            
+            // 绿色系列 - 植被
+            {r: 30, g: 120, b: 50, a: 255},   // 深绿色
+            {r: 50, g: 150, b: 70, a: 255},   // 绿色
+            {r: 70, g: 180, b: 90, a: 255},   // 亮绿色
+            
+            // 砖红及棕色系列
+            {r: 140, g: 80, b: 60, a: 255},   // 砖红色
+            {r: 120, g: 60, b: 40, a: 255},   // 深棕色
+            {r: 100, g: 50, b: 30, a: 255},   // 暗棕色
+            
+            // 其他常用基础色
+            {r: 255, g: 0, b: 0, a: 255},     // 纯红
+            {r: 0, g: 255, b: 0, a: 255},     // 纯绿
+            {r: 0, g: 0, b: 255, a: 255},     // 纯蓝
+            {r: 255, g: 255, b: 0, a: 255},   // 纯黄
+            {r: 0, g: 255, b: 255, a: 255},   // 纯青
+            {r: 255, g: 0, b: 255, a: 255},   // 纯紫
         ];
         
-        // 确保基础颜色存在于调色板中
-        basicColors.forEach(color => {
-            const key = this._colorToKey(color);
-            if (!colorMap.has(key)) {
-                colorMap.set(key, { color: RGBAUtil.copy(color), count: 0 });
+        // 收集所有唯一颜色，忽略完全透明的颜色
+        const uniqueColors = new Set<string>();
+        for (const color of colors) {
+            if (color.a === 0) continue;
+            const key = `${color.r},${color.g},${color.b},${color.a}`;
+            uniqueColors.add(key);
+        }
+        
+        // 如果唯一颜色数量少于限制，直接使用所有颜色
+        if (uniqueColors.size <= VoxExporter.MAX_COLORS - basePalette.length) {
+            const finalPalette = [...basePalette];
+            
+            // 添加所有唯一颜色
+            uniqueColors.forEach(key => {
+                const [r, g, b, a] = key.split(',').map(Number);
+                // 检查颜色是否已在基础调色板中
+                const colorKey = `${r},${g},${b},${a}`;
+                if (!finalPalette.some(c => `${c.r},${c.g},${c.b},${c.a}` === colorKey)) {
+                    finalPalette.push({r, g, b, a});
+                }
+            });
+            
+            // 创建颜色映射
+            const colorMap = new Map<string, number>();
+            finalPalette.forEach((color, index) => {
+                const key = `${color.r},${color.g},${color.b},${color.a}`;
+                colorMap.set(key, index);
+            });
+            
+            return { colorMap, palette: finalPalette };
+        }
+        
+        // 需要进行颜色量化
+        console.log(`需要量化颜色: 发现${uniqueColors.size}种颜色，超过限制`);
+        
+        // 提取所有RGB颜色（不包括透明）
+        const rgbColors: {r: number, g: number, b: number, a: number}[] = [];
+        const alphaColors: {r: number, g: number, b: number, a: number}[] = [];
+        
+        uniqueColors.forEach(key => {
+            const [r, g, b, a] = key.split(',').map(Number);
+            const color = {r, g, b, a};
+            if (a < 255) {
+                alphaColors.push(color);
+            } else {
+                rgbColors.push(color);
             }
         });
+        
+        // 统计每种颜色在模型中的出现次数
+        const colorCounts = new Map<string, number>();
+        for (const color of colors) {
+            if (color.a === 0) continue;
+            const key = `${color.r},${color.g},${color.b},${color.a}`;
+            colorCounts.set(key, (colorCounts.get(key) || 0) + 1);
+        }
+        
+        // 转换为HSV并按主色调分类
+        const colorByHueCategory: {[key: string]: {color: {r: number, g: number, b: number, a: number}, hsv: {h: number, s: number, v: number}, count: number}[]} = {};
+        
+        // 定义12个色相类别 (每30度一个类别)
+        const HUE_CATEGORIES = 12;
+        
+        for (const color of rgbColors) {
+            const key = `${color.r},${color.g},${color.b},${color.a}`;
+            const count = colorCounts.get(key) || 0;
+            const hsv = this._rgbToHsv(color.r, color.g, color.b);
+            
+            // 确定色相类别 (0-11)
+            const hueCategory = Math.floor(hsv.h / 360 * HUE_CATEGORIES);
+            
+            if (!colorByHueCategory[hueCategory]) {
+                colorByHueCategory[hueCategory] = [];
+            }
+            
+            colorByHueCategory[hueCategory].push({color, hsv, count});
+        }
+        
+        // 最终调色板
+        const finalPalette = [...basePalette];
+        
+        // 为半透明颜色保留位置
+        const maxAlphaSlots = Math.min(25, alphaColors.length);
+        
+        // 计算每个色相类别可以分配的颜色数
+        const remainingSlots = VoxExporter.MAX_COLORS - basePalette.length - maxAlphaSlots;
+        const categoryCounts = Object.keys(colorByHueCategory).length;
+        
+        // 每个类别至少分配的颜色数
+        let minColorsPerCategory = Math.min(3, Math.floor(remainingSlots / categoryCounts));
+        let extraColorsPool = remainingSlots - (minColorsPerCategory * categoryCounts);
+        
+        // 为每个色相类别分配颜色
+        Object.entries(colorByHueCategory).forEach(([categoryKey, categoryColors]) => {
+            const hueCategory = parseInt(categoryKey);
+            
+            // 如果类别为空，跳过
+            if (categoryColors.length === 0) return;
+            
+            // 按照重要性排序 (饱和度*明度*log(count))
+            categoryColors.sort((a, b) => {
+                const importanceA = (a.hsv.s * 0.7 + 0.3) * (a.hsv.v * 0.7 + 0.3) * Math.log10(1 + a.count);
+                const importanceB = (b.hsv.s * 0.7 + 0.3) * (b.hsv.v * 0.7 + 0.3) * Math.log10(1 + b.count);
+                return importanceB - importanceA;
+            });
+            
+            // 另外排序分级：按饱和度和亮度划分
+            // 分出暗色、中色、亮色各一个代表
+            const darkColors = categoryColors.filter(c => c.hsv.v < 0.4).sort((a, b) => b.count - a.count);
+            const midColors = categoryColors.filter(c => c.hsv.v >= 0.4 && c.hsv.v < 0.7).sort((a, b) => b.count - a.count);
+            const brightColors = categoryColors.filter(c => c.hsv.v >= 0.7).sort((a, b) => b.count - a.count);
+            
+            // 从每个亮度范围选择代表色
+            let selectedCount = 0;
+            const selectedColors: {r: number, g: number, b: number, a: number}[] = [];
+            
+            // 从暗、中、亮各选一个颜色（如果有）
+            if (darkColors.length > 0 && selectedCount < minColorsPerCategory) {
+                selectedColors.push(darkColors[0].color);
+                selectedCount++;
+            }
+            
+            if (midColors.length > 0 && selectedCount < minColorsPerCategory) {
+                selectedColors.push(midColors[0].color);
+                selectedCount++;
+            }
+            
+            if (brightColors.length > 0 && selectedCount < minColorsPerCategory) {
+                selectedColors.push(brightColors[0].color);
+                selectedCount++;
+            }
+            
+            // 如果还有额外配额，使用整体排序
+            if (extraColorsPool > 0) {
+                // 计算这个类别可以额外获得的颜色数量
+                // 基于该类别颜色数量在总颜色中的比例
+                const categoryTotal = categoryColors.length;
+                const totalColors = rgbColors.length;
+                
+                // 至少1个额外颜色，最多不超过剩余的extraColorsPool
+                const extraForThisCategory = Math.min(
+                    Math.max(1, Math.round(extraColorsPool * categoryTotal / totalColors)),
+                    extraColorsPool
+                );
+                
+                // 选择额外的颜色
+                for (let i = 0; i < categoryColors.length && selectedCount < minColorsPerCategory + extraForThisCategory; i++) {
+                    const colorEntry = categoryColors[i];
+                    const key = `${colorEntry.color.r},${colorEntry.color.g},${colorEntry.color.b},${colorEntry.color.a}`;
+                    
+                    // 检查是否已选择
+                    if (!selectedColors.some(c => `${c.r},${c.g},${c.b},${c.a}` === key)) {
+                        selectedColors.push(colorEntry.color);
+                        selectedCount++;
+                    }
+                }
+                
+                extraColorsPool -= (selectedCount - minColorsPerCategory);
+            }
+            
+            // 添加选定的颜色到最终调色板
+            for (const color of selectedColors) {
+                const key = `${color.r},${color.g},${color.b},${color.a}`;
+                
+                // 检查是否已在调色板中
+                if (!finalPalette.some(c => `${c.r},${c.g},${c.b},${c.a}` === key)) {
+                    finalPalette.push(color);
+                }
+            }
+        });
+        
+        // 处理蓝色特殊情况 - 确保有足够的蓝色变体用于塔楼屋顶
+        const specialBlueIndex = Math.floor(240 / 360 * HUE_CATEGORIES); // 蓝色大约在240度
+        if (colorByHueCategory[specialBlueIndex] && colorByHueCategory[specialBlueIndex].length > 0) {
+            const blueVariants = colorByHueCategory[specialBlueIndex]
+                .filter(entry => entry.hsv.s > 0.5 && entry.hsv.v > 0.5) // 筛选鲜艳的蓝色
+                .sort((a, b) => b.count - a.count);
+                
+            // 添加更多蓝色变体
+            for (let i = 0; i < Math.min(5, blueVariants.length); i++) {
+                const blueColor = blueVariants[i].color;
+                const key = `${blueColor.r},${blueColor.g},${blueColor.b},${blueColor.a}`;
+                
+                if (!finalPalette.some(c => `${c.r},${c.g},${c.b},${c.a}` === key)) {
+                    finalPalette.push(blueColor);
+                }
+            }
+        }
+        
+        // 如果还有空位，添加半透明颜色
+        for (let i = 0; i < maxAlphaSlots && i < alphaColors.length && finalPalette.length < VoxExporter.MAX_COLORS; i++) {
+            finalPalette.push(alphaColors[i]);
+        }
+        
+        // 如果仍有空位，填充一些完全生成的渐变色
+        if (finalPalette.length < VoxExporter.MAX_COLORS) {
+            // 生成一些补充色，确保颜色空间覆盖完整
+            // 每60度取一个色相，每个色相取不同饱和度和明度
+            for (let h = 0; h < 360 && finalPalette.length < VoxExporter.MAX_COLORS; h += 60) {
+                for (let s = 0.3; s <= 1 && finalPalette.length < VoxExporter.MAX_COLORS; s += 0.35) {
+                    for (let v = 0.3; v <= 1 && finalPalette.length < VoxExporter.MAX_COLORS; v += 0.35) {
+                        const rgb = this._hsvToRgb(h, s, v);
+                        const genColor = {r: rgb.r, g: rgb.g, b: rgb.b, a: 255};
+                        const key = `${genColor.r},${genColor.g},${genColor.b},${genColor.a}`;
+                        
+                        if (!finalPalette.some(c => `${c.r},${c.g},${c.b},${c.a}` === key)) {
+                            finalPalette.push(genColor);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 创建颜色映射
+        const colorMap = new Map<string, number>();
+        finalPalette.forEach((color, index) => {
+            const key = `${color.r},${color.g},${color.b},${color.a}`;
+            colorMap.set(key, index);
+        });
+        
+        console.log(`创建了${finalPalette.length}种颜色的调色板`);
+        
+        if (uniqueColors.size > VoxExporter.MAX_COLORS) {
+            StatusHandler.warning(LOC('something_went_wrong'));
+        }
+        
+        return { colorMap, palette: finalPalette };
     }
     
-    private _colorToKey(color: RGBA): string {
-        return `${Math.round(color.r*255)},${Math.round(color.g*255)},${Math.round(color.b*255)},${Math.round(color.a*255)}`;
+    /**
+     * RGB转HSV
+     */
+    private _rgbToHsv(r: number, g: number, b: number): {h: number, s: number, v: number} {
+        // 归一化RGB值到0-1
+        const rn = r / 255;
+        const gn = g / 255;
+        const bn = b / 255;
+        
+        const max = Math.max(rn, gn, bn);
+        const min = Math.min(rn, gn, bn);
+        const delta = max - min;
+        
+        // 计算HSV
+        let h = 0;
+        const s = max === 0 ? 0 : delta / max;
+        const v = max;
+        
+        // 计算色相
+        if (delta === 0) {
+            h = 0; // 灰色
+        } else if (max === rn) {
+            h = ((gn - bn) / delta) % 6;
+        } else if (max === gn) {
+            h = (bn - rn) / delta + 2;
+        } else {
+            h = (rn - gn) / delta + 4;
+        }
+        
+        h = Math.round(h * 60);
+        if (h < 0) h += 360;
+        
+        return {h, s, v};
     }
     
-    private _createMainChunk(
-        voxels: Array<Voxel & { litColor: RGBA, material: string }>, 
-        minPos: Vector3, 
-        size: Vector3, 
-        colorMap: Map<string, number>, 
-        palette: Uint8Array
-    ): Uint8Array {
+    /**
+     * HSV转RGB
+     */
+    private _hsvToRgb(h: number, s: number, v: number): {r: number, g: number, b: number} {
+        const c = v * s;
+        const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+        const m = v - c;
+        
+        let r = 0, g = 0, b = 0;
+        
+        if (h >= 0 && h < 60) {
+            r = c; g = x; b = 0;
+        } else if (h >= 60 && h < 120) {
+            r = x; g = c; b = 0;
+        } else if (h >= 120 && h < 180) {
+            r = 0; g = c; b = x;
+        } else if (h >= 180 && h < 240) {
+            r = 0; g = x; b = c;
+        } else if (h >= 240 && h < 300) {
+            r = x; g = 0; b = c;
+        } else {
+            r = c; g = 0; b = x;
+        }
+        
+        return {
+            r: Math.round((r + m) * 255),
+            g: Math.round((g + m) * 255),
+            b: Math.round((b + m) * 255)
+        };
+    }
+    
+    /**
+     * 查找最接近的颜色索引
+     */
+    private _findClosestColorIndex(targetColor: {r: number, g: number, b: number, a: number}, palette: {r: number, g: number, b: number, a: number}[]): number {
+        // 处理透明度特例
+        if (targetColor.a < 128) {
+            return 0; // 透明色
+        }
+        
+        // 转换为HSV颜色空间
+        const targetHSV = this._rgbToHsv(targetColor.r, targetColor.g, targetColor.b);
+        
+        // 处理特殊颜色情况
+        
+        // 1. 蓝色屋顶情况 - 特别处理蓝色，确保蓝色屋顶被正确识别
+        const isBlueRoof = targetHSV.h >= 200 && targetHSV.h <= 250 && 
+                          targetHSV.s > 0.5 && targetHSV.v > 0.5;
+        
+        if (isBlueRoof) {
+            // 寻找最匹配的蓝色
+            let bestBlueIndex = 1; // 默认白色
+            let minBlueDiff = Number.MAX_VALUE;
+            
+            for (let i = 0; i < palette.length; i++) {
+                const color = palette[i];
+                if (color.a === 0) continue; // 跳过透明色
+                
+                const hsv = this._rgbToHsv(color.r, color.g, color.b);
+                
+                // 检查是否为蓝色范围
+                if (hsv.h >= 200 && hsv.h <= 250 && hsv.s > 0.4) {
+                    // 计算色相、饱和度和明度的加权差值
+                    const hueDiff = Math.abs(targetHSV.h - hsv.h) / 50; // 归一化到0-1
+                    const satDiff = Math.abs(targetHSV.s - hsv.s);
+                    const valDiff = Math.abs(targetHSV.v - hsv.v);
+                    
+                    // 总差异，明度权重更高
+                    const totalDiff = hueDiff * 0.3 + satDiff * 0.3 + valDiff * 0.4;
+                    
+                    if (totalDiff < minBlueDiff) {
+                        minBlueDiff = totalDiff;
+                        bestBlueIndex = i;
+                    }
+                }
+            }
+            
+            // 如果找到了合适的蓝色
+            if (minBlueDiff < 0.4) {
+                return bestBlueIndex;
+            }
+        }
+        
+        // 2. 处理灰度颜色
+        const isGrey = targetHSV.s < 0.15;
+        
+        if (isGrey) {
+            // 寻找最接近的灰度
+            let bestGreyIndex = 1; // 默认白色
+            let minValueDiff = Number.MAX_VALUE;
+            
+            for (let i = 0; i < palette.length; i++) {
+                const color = palette[i];
+                // 跳过透明色
+                if (color.a === 0) continue;
+                
+                const hsv = this._rgbToHsv(color.r, color.g, color.b);
+                
+                // 检查是否为灰色(低饱和度)
+                if (hsv.s < 0.15) {
+                    const valueDiff = Math.abs(hsv.v - targetHSV.v);
+                    if (valueDiff < minValueDiff) {
+                        minValueDiff = valueDiff;
+                        bestGreyIndex = i;
+                    }
+                }
+            }
+            
+            if (minValueDiff < 0.15) {
+                return bestGreyIndex;
+            }
+        }
+        
+        // 3. 处理木材和砖红色系
+        const isWoodOrBrick = (targetHSV.h >= 10 && targetHSV.h <= 50) && 
+                              targetHSV.s > 0.2 && targetHSV.s < 0.8 &&
+                              targetHSV.v > 0.2 && targetHSV.v < 0.8;
+                              
+        if (isWoodOrBrick) {
+            let bestIndex = 1;
+            let minDiff = Number.MAX_VALUE;
+            
+            for (let i = 0; i < palette.length; i++) {
+                const color = palette[i];
+                if (color.a === 0) continue;
+                
+                const hsv = this._rgbToHsv(color.r, color.g, color.b);
+                
+                // 检查是否为木材或砖红色范围
+                if (hsv.h >= 10 && hsv.h <= 50 && 
+                    hsv.s > 0.2 && hsv.s < 0.8 &&
+                    hsv.v > 0.2 && hsv.v < 0.8) {
+                    
+                    const hueDiff = Math.abs(targetHSV.h - hsv.h) / 40;
+                    const satDiff = Math.abs(targetHSV.s - hsv.s);
+                    const valDiff = Math.abs(targetHSV.v - hsv.v);
+                    
+                    const totalDiff = hueDiff * 0.4 + satDiff * 0.3 + valDiff * 0.3;
+                    
+                    if (totalDiff < minDiff) {
+                        minDiff = totalDiff;
+                        bestIndex = i;
+                    }
+                }
+            }
+            
+            if (minDiff < 0.3) {
+                return bestIndex;
+            }
+        }
+        
+        // 普通颜色匹配逻辑
+        let closestIndex = 1; // 默认是白色(索引1)
+        let minDistance = Number.MAX_VALUE;
+        
+        // 透明度敏感匹配
+        const isTargetSemiTransparent = targetColor.a >= 128 && targetColor.a < 250;
+        
+        for (let i = 1; i < palette.length; i++) {
+            const color = palette[i];
+            
+            // 处理透明度匹配
+            const isPaletteSemiTransparent = color.a >= 128 && color.a < 250;
+            
+            // 如果是半透明色，则优先匹配半透明与否相同的颜色
+            if (isTargetSemiTransparent !== isPaletteSemiTransparent) {
+                continue; // 跳过透明度不匹配的颜色
+            }
+            
+            // HSV颜色空间中的距离计算
+            const hsv = this._rgbToHsv(color.r, color.g, color.b);
+            
+            // 色相距离 (考虑色环特性)
+            let hueDiff = Math.abs(targetHSV.h - hsv.h);
+            if (hueDiff > 180) hueDiff = 360 - hueDiff;
+            
+            // 归一化距离分量
+            const normHueDiff = hueDiff / 180.0;
+            const satDiff = Math.abs(targetHSV.s - hsv.s);
+            const valDiff = Math.abs(targetHSV.v - hsv.v);
+            
+            // 饱和度与明度的权重应根据颜色特性动态调整
+            let hueWeight = 1.0;
+            let satWeight = 1.0;
+            let valWeight = 1.2;
+            
+            // 对于低饱和度颜色，降低色相重要性，提高明度重要性
+            if (targetHSV.s < 0.2 || hsv.s < 0.2) {
+                hueWeight = 0.3;
+                valWeight = 1.8;
+            }
+            
+            // 对于高饱和度颜色，提高色相重要性
+            if (targetHSV.s > 0.7 && hsv.s > 0.7) {
+                hueWeight = 1.5;
+                satWeight = 0.8;
+            }
+            
+            // 对于暗色，提高饱和度重要性
+            if (targetHSV.v < 0.2 || hsv.v < 0.2) {
+                satWeight = 0.5;
+                valWeight = 1.8;
+            }
+            
+            // 计算加权欧氏距离
+            const distance = Math.sqrt(
+                hueWeight * normHueDiff * normHueDiff +
+                satWeight * satDiff * satDiff +
+                valWeight * valDiff * valDiff
+            );
+            
+            if (distance < minDistance) {
+                minDistance = distance;
+                closestIndex = i;
+            }
+        }
+        
+        return closestIndex;
+    }
+    
+    /**
+     * 创建VOX文件头
+     */
+    private _createVoxHeader(): Buffer {
+        const buffer = Buffer.alloc(8);
+        
+        // 写入"VOX "标识
+        buffer.write('VOX ', 0);
+        
+        // 写入版本号（150）
+        buffer.writeInt32LE(150, 4);
+        
+        return buffer;
+    }
+    
+    /**
+     * 创建主块（MAIN）
+     */
+    private _createMainChunk(sizeX: number, sizeY: number, sizeZ: number, voxels: Array<{x: number, y: number, z: number, colorIndex: number}>, palette: {r: number, g: number, b: number, a: number}[]): Buffer {
         // 创建SIZE块
-        const sizeChunk = this._createSizeChunk(size);
+        const sizeChunk = this._createSizeChunk(sizeX, sizeY, sizeZ);
         
         // 创建XYZI块
-        const xyziChunk = this._createXYZIChunk(voxels, minPos, colorMap);
+        const xyziChunk = this._createXYZIChunk(voxels);
         
         // 创建RGBA块
         const rgbaChunk = this._createRGBAChunk(palette);
         
-        // 计算MAIN块大小
-        const mainChunkSize = sizeChunk.length + xyziChunk.length + rgbaChunk.length;
+        // 计算子块总大小
+        const childrenSize = sizeChunk.length + xyziChunk.length + rgbaChunk.length;
         
         // 创建MAIN块头
-        const mainChunkHeader = new Uint8Array([
-            // "MAIN" ID
-            0x4D, 0x41, 0x49, 0x4E,
-            // 内容大小 (0因为MAIN没有内容，只有子块)
-            0, 0, 0, 0,
-            // 子块大小
-        ]);
-        
-        // 添加子块大小
-        const sizeBytes = this._writeInt32(mainChunkSize);
-        const mainHeader = new Uint8Array(mainChunkHeader.length + sizeBytes.length);
-        mainHeader.set(mainChunkHeader);
-        mainHeader.set(sizeBytes, mainChunkHeader.length);
+        const mainHeader = Buffer.alloc(12);
+        mainHeader.write('MAIN', 0);
+        mainHeader.writeInt32LE(0, 4);  // 内容大小为0
+        mainHeader.writeInt32LE(childrenSize, 8);  // 子块大小
         
         // 合并所有块
-        const result = new Uint8Array(mainHeader.length + mainChunkSize);
-        result.set(mainHeader, 0);
-        result.set(sizeChunk, mainHeader.length);
-        result.set(xyziChunk, mainHeader.length + sizeChunk.length);
-        result.set(rgbaChunk, mainHeader.length + sizeChunk.length + xyziChunk.length);
-        
-        return result;
+        return Buffer.concat([
+            mainHeader,
+            sizeChunk,
+            xyziChunk,
+            rgbaChunk
+        ]);
     }
     
-    private _createSizeChunk(size: Vector3): Uint8Array {
-        // "SIZE" ID
-        const sizeId = new Uint8Array([0x53, 0x49, 0x5A, 0x45]);
-        // 内容大小
-        const contentSize = new Uint8Array([12, 0, 0, 0]);
-        // 子块大小
-        const childSize = new Uint8Array([0, 0, 0, 0]);
-        // SIZE数据: x, y, z
-        const xBytes = this._writeInt32(Math.floor(size.x));
-        const yBytes = this._writeInt32(Math.floor(size.z)); // 注意：交换了Y和Z轴
-        const zBytes = this._writeInt32(Math.floor(size.y));
+    /**
+     * 创建SIZE块
+     */
+    private _createSizeChunk(sizeX: number, sizeY: number, sizeZ: number): Buffer {
+        const buffer = Buffer.alloc(24);
         
-        // 合并数据
-        const chunk = new Uint8Array(sizeId.length + contentSize.length + childSize.length + 
-                                    xBytes.length + yBytes.length + zBytes.length);
-        let offset = 0;
-        chunk.set(sizeId, offset); offset += sizeId.length;
-        chunk.set(contentSize, offset); offset += contentSize.length;
-        chunk.set(childSize, offset); offset += childSize.length;
-        chunk.set(xBytes, offset); offset += xBytes.length;
-        chunk.set(yBytes, offset); offset += yBytes.length;
-        chunk.set(zBytes, offset);
+        // 块头部
+        buffer.write('SIZE', 0);
+        buffer.writeInt32LE(12, 4);  // 内容大小
+        buffer.writeInt32LE(0, 8);   // 子块大小
         
-        return chunk;
+        // 块内容
+        buffer.writeInt32LE(sizeX, 12);
+        buffer.writeInt32LE(sizeZ, 16);  // 注意：MagicaVoxel使用Y-up坐标系，但我们使用Z-up，所以交换Y和Z
+        buffer.writeInt32LE(sizeY, 20);
+        
+        return buffer;
     }
     
-    private _createXYZIChunk(
-        voxels: Array<Voxel & { litColor: RGBA, material: string }>, 
-        minPos: Vector3, 
-        colorMap: Map<string, number>
-    ): Uint8Array {
-        // 计算体素数据大小
-        const voxelCount = voxels.length;
-        const contentSize = 4 + voxelCount * 4; // 4字节数量 + 每个体素4字节(x,y,z,c)
+    /**
+     * 创建XYZI块
+     */
+    private _createXYZIChunk(voxels: Array<{x: number, y: number, z: number, colorIndex: number}>): Buffer {
+        const buffer = Buffer.alloc(16 + voxels.length * 4);
         
-        // "XYZI" ID
-        const xyziId = new Uint8Array([0x58, 0x59, 0x5A, 0x49]);
-        // 内容大小
-        const contentSizeBytes = this._writeInt32(contentSize);
-        // 子块大小
-        const childSize = new Uint8Array([0, 0, 0, 0]);
+        // 块头部
+        buffer.write('XYZI', 0);
+        buffer.writeInt32LE(4 + voxels.length * 4, 4);  // 内容大小 (4字节numVoxels + 每个体素4字节)
+        buffer.writeInt32LE(0, 8);  // 子块大小
+        
         // 体素数量
-        const voxelCountBytes = this._writeInt32(voxelCount);
+        buffer.writeInt32LE(voxels.length, 12);
         
-        // 创建头部
-        const headerSize = xyziId.length + contentSizeBytes.length + childSize.length + voxelCountBytes.length;
-        const header = new Uint8Array(headerSize);
-        let offset = 0;
-        header.set(xyziId, offset); offset += xyziId.length;
-        header.set(contentSizeBytes, offset); offset += contentSizeBytes.length;
-        header.set(childSize, offset); offset += childSize.length;
-        header.set(voxelCountBytes, offset);
-        
-        // 创建体素数据
-        const voxelData = new Uint8Array(voxelCount * 4);
-        
-        let validVoxelCount = 0;
-        voxels.forEach((voxel, index) => {
-            // 计算相对坐标，确保为整数
-            // 注意：MagicaVoxel使用右手坐标系，我们需要调整坐标映射
-            const x = Math.floor(voxel.position.x - minPos.x);
-            const y = Math.floor(voxel.position.z - minPos.z); // Z轴映射到Y轴
-            const z = Math.floor(voxel.position.y - minPos.y); // Y轴映射到Z轴
-            
-            // 确保坐标在有效范围内
-            if (x < 0 || x > 255 || y < 0 || y > 255 || z < 0 || z > 255) {
-                LOG(`Voxel at (${x},${y},${z}) outside valid range, skipping`);
-                return;
-            }
-            
-            // 使用带有光照的颜色
-            const colorKey = this._colorToKey(voxel.litColor);
-            const colorIndex = colorMap.get(colorKey) || 1; // 默认使用第一个颜色
-            
-            // 设置体素数据 (x, y, z, colorIndex)
-            const voxelIndex = validVoxelCount * 4;
-            voxelData[voxelIndex] = x;
-            voxelData[voxelIndex + 1] = y;
-            voxelData[voxelIndex + 2] = z;
-            voxelData[voxelIndex + 3] = colorIndex;
-            
-            validVoxelCount++;
-        });
-        
-        // 如果有些体素被跳过，调整最终数据大小
-        let finalVoxelData = voxelData;
-        if (validVoxelCount < voxelCount) {
-            finalVoxelData = voxelData.slice(0, validVoxelCount * 4);
-            // 需要调整内容大小和体素数量
-            const newContentSize = 4 + validVoxelCount * 4;
-            contentSizeBytes.set(this._writeInt32(newContentSize));
-            voxelCountBytes.set(this._writeInt32(validVoxelCount));
+        // 体素数据
+        let offset = 16;
+        for (const voxel of voxels) {
+            buffer.writeUInt8(voxel.x, offset);
+            buffer.writeUInt8(voxel.z, offset + 1);  // 交换Y和Z坐标
+            buffer.writeUInt8(voxel.y, offset + 2);
+            buffer.writeUInt8(voxel.colorIndex, offset + 3);
+            offset += 4;
         }
         
-        // 合并块头和体素数据
-        const result = new Uint8Array(header.length + finalVoxelData.length);
-        result.set(header, 0);
-        result.set(finalVoxelData, header.length);
-        
-        return result;
+        return buffer;
     }
     
-    private _createRGBAChunk(palette: Uint8Array): Uint8Array {
-        // "RGBA" ID
-        const rgbaId = new Uint8Array([0x52, 0x47, 0x42, 0x41]);
-        // 内容大小 (256个颜色 * 4字节)
-        const contentSize = new Uint8Array([0, 4, 0, 0]);
-        // 子块大小
-        const childSize = new Uint8Array([0, 0, 0, 0]);
+    /**
+     * 创建RGBA块
+     */
+    private _createRGBAChunk(palette: {r: number, g: number, b: number, a: number}[]): Buffer {
+        const buffer = Buffer.alloc(1024 + 12);  // 256个RGBA值 + 头部
         
-        // 合并数据
-        const chunk = new Uint8Array(rgbaId.length + contentSize.length + childSize.length + palette.length);
-        let offset = 0;
-        chunk.set(rgbaId, offset); offset += rgbaId.length;
-        chunk.set(contentSize, offset); offset += contentSize.length;
-        chunk.set(childSize, offset); offset += childSize.length;
-        chunk.set(palette, offset);
+        // 块头部
+        buffer.write('RGBA', 0);
+        buffer.writeInt32LE(1024, 4);  // 内容大小
+        buffer.writeInt32LE(0, 8);     // 子块大小
         
-        return chunk;
-    }
-    
-    private _writeInt32(value: number): Uint8Array {
-        return new Uint8Array([
-            value & 0xFF,
-            (value >> 8) & 0xFF,
-            (value >> 16) & 0xFF,
-            (value >> 24) & 0xFF
-        ]);
+        // 初始化所有颜色为0
+        for (let i = 0; i < 256; i++) {
+            const offset = 12 + i * 4;
+            buffer.writeUInt8(0, offset);     // R
+            buffer.writeUInt8(0, offset + 1); // G
+            buffer.writeUInt8(0, offset + 2); // B
+            buffer.writeUInt8(0, offset + 3); // A
+        }
+        
+        // 填充调色板
+        palette.forEach((color, index) => {
+            const offset = 12 + index * 4;
+            buffer.writeUInt8(color.r, offset);
+            buffer.writeUInt8(color.g, offset + 1);
+            buffer.writeUInt8(color.b, offset + 2);
+            buffer.writeUInt8(color.a, offset + 3);
+        });
+        
+        return buffer;
     }
 } 
