@@ -240,7 +240,7 @@ export class VoxExporter extends IExporter {
         
         for (const voxel of voxels) {
             // 计算相对位置
-            const x = Math.floor(voxel.position.x - minPos.x);
+            const x = size.x -1 - Math.floor(voxel.position.x - minPos.x);
             const y = Math.floor(voxel.position.y - minPos.y);
             const z = Math.floor(voxel.position.z - minPos.z);
             
